@@ -1,0 +1,13 @@
+[package]
+name = "bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# The base64 crate, the most downloaded Rust base64 implementation
+[dependencies]
+base64 = "0.22"
+
+[profile.release]
+codegen-units = 1
+lto = true
