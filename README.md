@@ -21,7 +21,7 @@ Add the package to your app header:
 ```roc
 app [main!] {
 	pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.28.1/7brgwR8YUqfeGrkdfF1V4GPPN7DnP7ftqub9KcrTEZtr.tar.zst",
-	base64: "https://github.com/jaredramirez/roc-base64/releases/download/0.1.0/GBU8JYLnPyrNNenPvjpyAtxkmuMiN5ZLjBZyv7RBw4Po.tar.zst",
+	base64: "https://github.com/jaredramirez/roc-base64/releases/download/0.2.0/7upLPXDxonerqFrwz2zVjgQt4mPkkg6Pn2PBwgD59932.tar.zst",
 }
 
 import pf.Stdout
