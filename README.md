@@ -16,16 +16,21 @@ Written for the Roc 0.1.0_RC1 compiler.
 
 ## Usage
 
-Add the package to your app header, using the URL from the
-[latest release](../../releases/latest):
+Add the package to your app header:
 
 ```roc
 app [main!] {
-	pf: platform "...",
-	base64: "https://github.com/<owner>/roc-base64/releases/download/<version>/<hash>.tar.zst",
+	pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.28.1/7brgwR8YUqfeGrkdfF1V4GPPN7DnP7ftqub9KcrTEZtr.tar.zst",
+	base64: "https://github.com/jaredramirez/roc-base64/releases/download/0.1.0/GBU8JYLnPyrNNenPvjpyAtxkmuMiN5ZLjBZyv7RBw4Po.tar.zst",
 }
 
+import pf.Stdout
 import base64.Base64
+
+main! = |_args| {
+	Stdout.line!(Base64.encode("foobar".to_utf8()))?
+	Ok({})
+}
 ```
 
 ```roc
