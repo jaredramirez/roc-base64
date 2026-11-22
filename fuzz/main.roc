@@ -27,8 +27,9 @@ options_for = |choice| {
 	)
 }
 
-## Encoding round trips and has the predicted length, and strict decoding of
-## arbitrary bytes either fails or accepts only the canonical encoding
+## Encoding round trips and has the predicted length, strict decoding of
+## arbitrary bytes either fails or accepts only the canonical encoding, and
+## decoding arbitrary bytes with any options reports errors where they are
 test! : Input => Fuzz.Outcome
 test! = |{ data, choice }| {
 	(encode_options, decode_options) = options_for(choice)
@@ -45,6 +46,27 @@ test! = |{ data, choice }| {
 	match Base64.decode_bytes_with(data, strict) {
 		Ok(decoded) if Base64.encode_to_bytes_with(decoded, canonical) == data => {}
 		Ok(_) => crash "strict decoding accepted a non-canonical encoding"
+		Err(InvalidBase64({ index, problem: _ })) if index <= data.len() => {}
+		Err(_) => crash "error index past the end of the input"
+	}
+
+	# Any options, on arbitrary bytes: errors point at the offending byte, and
+	# whatever decodes re-encodes to something strict decoding accepts
+	lenient = {
+		alphabet: decode_options.alphabet,
+		padding: if (choice.bitwise_and(0x40) == 0) Optional else decode_options.padding,
+		whitespace: if (choice.bitwise_and(0x80) == 0) Ignore else Reject,
+		trailing_bits: if (choice.bitwise_and(0x20) == 0) Allow else Reject,
+	}
+	match Base64.decode_bytes_with(data, lenient) {
+		Ok(decoded) => {
+			again = Base64.encode_to_bytes_with(decoded, canonical)
+			if Base64.decode_bytes_with(again, strict) != Ok(decoded) {
+				crash "a lenient decode did not survive a canonical round trip"
+			}
+		}
+		Err(InvalidBase64({ index, problem: InvalidByte(byte) })) if data.get(index) == Ok(byte) => {}
+		Err(InvalidBase64({ problem: InvalidByte(_), .. })) => crash "InvalidByte points at the wrong byte"
 		Err(InvalidBase64({ index, problem: _ })) if index <= data.len() => {}
 		Err(_) => crash "error index past the end of the input"
 	}

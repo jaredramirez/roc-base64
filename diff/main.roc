@@ -159,6 +159,17 @@ check_input! = |input, mutated| {
 		$mismatches = $mismatches.append({ check: "encode_url_unpadded vs basenc, unpadded", input, ours: show(url_unpadded), theirs: show(theirs_unpadded) })
 	}
 
+	# Our decoder must read the tools' wrapped and unpadded output
+	gnu_wrapped = encode_tool!("base64", [], input)?
+	$checks = $checks + 1
+	if Base64.decode_bytes_with(gnu_wrapped, { ..Base64.default_decode, whitespace: Ignore }) != Ok(input) {
+		$mismatches = $mismatches.append({ check: "decode with whitespace: Ignore of base64 (wrapped)", input, ours: "did not decode to the input", theirs: show(gnu_wrapped) })
+	}
+	$checks = $checks + 1
+	if Base64.decode_bytes_with(theirs_unpadded, { ..Base64.default_decode, alphabet: UrlSafe, padding: Forbidden }) != Ok(input) {
+		$mismatches = $mismatches.append({ check: "decode_url_unpadded of basenc, unpadded", input, ours: "did not decode to the input", theirs: show(theirs_unpadded) })
+	}
+
 	# Decoding: each tool must decode our output back to the input
 	decodings = [
 		("base64 -d decodes encode", standard, ("base64", ["-d"])),

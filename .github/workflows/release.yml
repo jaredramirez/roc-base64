@@ -1,11 +1,11 @@
 name: Release
 
-# Push a tag such as 0.1.0 to publish the bundle as a release asset. The
+# Push a version tag such as 0.1.0 to publish the bundle as a release asset. The
 # package URL is then
 # https://github.com/<owner>/roc-base64/releases/download/<tag>/<hash>.tar.zst
 on:
   push:
-    tags: ["*"]
+    tags: ["[0-9]+.[0-9]+.[0-9]+"]
 
 permissions:
   contents: write
@@ -20,6 +20,10 @@ jobs:
         run: nix profile install nixpkgs#devenv
       - name: Test
         run: devenv test
+      - name: Check SIMD speedups
+        run: devenv shell just perf-check
+      - name: Compare against coreutils and OpenSSL
+        run: devenv shell just diff --count 2000
       - name: Bundle
         run: devenv shell just bundle
       - name: Publish

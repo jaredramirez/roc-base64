@@ -1,7 +1,7 @@
 { pkgs, ... }:
 let
-  # Roc publishes static binaries, so the release tarball is used as-is
-  # tarball for each platform
+  # Roc publishes a static binary in a release tarball for each platform,
+  # which is used as-is
   rocReleases = {
     x86_64-linux = {
       target = "linux_x86_64";

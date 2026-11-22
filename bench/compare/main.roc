@@ -58,6 +58,9 @@ run! = |os_args|
 	match os_args.map(OsStr.display) {
 		[size_str, iterations_str] => {
 			size = U64.from_str(size_str) ? |_| BenchFailed("SIZE must be an integer")
+			if size == 0 {
+				return Err(BenchFailed("SIZE must be at least 1"))
+			}
 			(unit, show_time) = time_unit(size)
 			var $rows = []
 			for entry in entries {

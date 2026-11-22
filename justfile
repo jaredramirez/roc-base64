@@ -36,7 +36,7 @@ diff *args:
     roc diff/main.roc "$@"
 
 # Time encoding and decoding SIZE bytes with the optimizing backend.
-bench size="1048576" iterations="100":
+bench size="1048576" iterations="200":
     mkdir -p bench-out
     roc build --opt=speed bench/main.roc --output=bench-out/roc
     ./bench-out/roc {{size}} {{iterations}}
@@ -48,7 +48,7 @@ perf-check:
     ./bench-out/check
 
 # Compare against Rust, Go, Zig, Node.js, and Python; prints a Markdown table.
-bench-compare size="1048576" iterations="100":
+bench-compare size="1048576" iterations="200":
     devenv --profile bench shell -- just _bench-compare {{size}} {{iterations}}
 
 _bench-compare size iterations:

@@ -63,20 +63,23 @@ Base64.decode_with(text, { ..Base64.default_decode, alphabet: UrlSafe, padding: 
 `encode_to_bytes_with` and `decode_bytes_with` work on ASCII bytes instead of
 `Str`, and `encoded_len` gives the exact output length for an input length.
 
-Decoding errors are `InvalidBase64({ index, problem })`, where `index` is the
-byte offset in the input (its length for problems at the end) and `problem` is
+Decoding errors are `InvalidBase64({ index, problem })`, where `problem` is
 one of `InvalidByte(byte)`, `InvalidLength`, `MissingPadding`,
-`UnexpectedPadding`, `DataAfterPadding`, or `NonZeroTrailingBits`.
+`UnexpectedPadding`, `DataAfterPadding`, or `NonZeroTrailingBits`, and
+`index` is the byte offset of the problem in the input. `InvalidLength` and
+`MissingPadding` report the input's length, and `NonZeroTrailingBits` the last
+character.
 
 ## Performance
 
 Encoding and decoding use SIMD (Roc's `U8x16` vectors, which lower to NEON on
 ARM and SSE on x86-64) for 12 input bytes or 16 characters at a time, following
 Wojciech Muła and Daniel Lemire, ["Faster Base64 Encoding and Decoding using
-AVX2 Instructions"](https://arxiv.org/abs/1704.00605). Decoding drops to a
-byte-at-a-time loop from the first chunk that holds anything but alphabet
-characters, such as padding, whitespace, or an error, so error positions stay
-exact.
+AVX2 Instructions"](https://arxiv.org/abs/1704.00605). When a chunk holds
+anything but alphabet characters, such as padding, a line break, or an error,
+decoding keeps the whole groups before it, handles the rest a character at a
+time, and goes back to SIMD at the next group, so error positions stay exact
+and wrapped input stays fast.
 
 Compared with the standard or most popular base64 in other languages, using
 the standard alphabet. Each figure is the fastest of 200 samples, after two
@@ -86,23 +89,23 @@ warm-up runs, and includes allocating the output.
 
 | Language | Library | Encode MB/s | Encode µs | Decode MB/s | Decode µs |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Roc | roc-base64 | 10512 | 99.8 | 10276 | 102.0 |
-| Rust | base64 crate | 4575 | 229.2 | 4544 | 230.8 |
-| Go | encoding/base64 | 3133 | 334.7 | 4282 | 244.9 |
-| Zig | std.base64 | 5754 | 182.2 | 4747 | 220.9 |
-| Node.js | Buffer | 27654 | 37.9 | 14513 | 72.3 |
-| Python | base64 (C) | 1345 | 779.3 | 1149 | 911.9 |
+| Roc | roc-base64 | 10030 | 104.5 | 7532 | 139.2 |
+| Rust | base64 crate | 4671 | 224.5 | 4672 | 224.4 |
+| Go | encoding/base64 | 3243 | 323.3 | 4287 | 244.6 |
+| Zig | std.base64 | 5769 | 181.8 | 4751 | 220.7 |
+| Node.js | Buffer | 25890 | 40.5 | 14513 | 72.3 |
+| Python | base64 (C) | 1349 | 776.8 | 1151 | 910.6 |
 
 **64 bytes**, where the fixed cost of each call dominates
 
 | Language | Library | Encode MB/s | Encode ns | Decode MB/s | Decode ns |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Roc | roc-base64 | 2370 | 27 | 1600 | 40 |
+| Roc | roc-base64 | 2285 | 28 | 1488 | 43 |
 | Rust | base64 crate | 2666 | 24 | 2782 | 23 |
-| Go | encoding/base64 | 1882 | 34 | 2285 | 28 |
+| Go | encoding/base64 | 1882 | 34 | 2370 | 27 |
 | Zig | std.base64 | 3555 | 18 | 3368 | 19 |
-| Node.js | Buffer | 1882 | 34 | 1142 | 56 |
-| Python | base64 (C) | 640 | 100 | 421 | 152 |
+| Node.js | Buffer | 1939 | 33 | 1122 | 57 |
+| Python | base64 (C) | 633 | 101 | 418 | 153 |
 
 Measured on an Apple M5 Pro with Roc 0.1.0_RC1 (`--opt=speed`), Rust 1.98.1
 with base64 0.22.1, Go 1.26.8, Zig 0.16.0 (`ReleaseFast`), Node.js 24.21.0, and
@@ -111,9 +114,13 @@ second; small inputs time batches of calls covering 256 KiB. Roc figures vary
 by about 10% between runs. Node.js uses
 [simdutf](https://github.com/simdutf/simdutf), which processes 64 bytes at a
 time with interleaving loads that Roc does not expose; Rust, Go, Zig, and
-Python are scalar. roc-base64 also checks canonical encoding while decoding,
-and Python's figures use `b64decode(validate=True)` so that it rejects invalid
-input too.
+Python are scalar. The decoders do different amounts of checking: roc-base64
+and Rust's base64 crate reject invalid characters and non-zero trailing bits,
+Python's figures use `b64decode(validate=True)` so that it rejects invalid
+characters, and Node.js skips invalid characters without reporting them.
+
+MIME input, wrapped at 76 characters with CRLF, encodes at about 3 GB/s and
+decodes at about 4.5 GB/s; `just perf-check` prints the times for each mode.
 
 `encode` returns a `Str`, which checks that its bytes are UTF-8. Encoding to
 bytes with `encode_to_bytes_with` skips that check and is about 15% faster on
@@ -144,18 +151,23 @@ With direnv installed, `direnv allow` activates the same environment
 automatically. `devenv test` runs the checks, tests, and a formatting check.
 
 The tests include the RFC 4648 vectors, vectors checked against Python's
-`base64` module, and round trips of every byte value with every combination of
-options. To guard the SIMD paths, they compare encoding and decoding with a
+`base64` module, and round trips of every byte value with each alphabet,
+padding mode, and line wrapping. To guard the SIMD paths, they compare encoding and decoding with a
 plain reference implementation at every length up to 100 and around larger
-chunk boundaries, place every byte value in every lane of a chunk, and check
-that a bad byte at any position of a long input is reported at that position.
+chunk boundaries, place every byte value in every lane of a chunk for both
+alphabets, check that a bad byte at any position of a long or wrapped input is
+reported at that position, and decode wrapped input at every line width up to
+40 with both newlines.
 
 `just perf-check` guards against slowdowns the tests cannot see, such as a
 SIMD path that silently falls back to the byte-at-a-time loop: it fails unless
-SIMD encoding and decoding are at least twice as fast as byte-at-a-time
-baselines measured in the same process. CI runs it on every push. The [roc-fuzz](https://github.com/lukewilliamboswell/roc-fuzz) target
-checks round trips, `encoded_len`, and that strict decoding accepts only
-canonical encodings.
+encoding and decoding, with each alphabet and with MIME wrapping, are at least
+twice as fast as byte-at-a-time implementations measured in the same process.
+CI runs it, the tests, the differential test, and a minute of fuzzing on
+Linux and macOS for every push to main and every pull request. The [roc-fuzz](https://github.com/lukewilliamboswell/roc-fuzz) target
+checks round trips, `encoded_len`, that strict decoding accepts only
+canonical encodings, and that decoding arbitrary bytes with any options
+reports invalid characters where they are.
 
 `just diff` checks the package against independent implementations, which
 devenv provides so they behave the same on every platform. For each random
@@ -164,12 +176,14 @@ wrapped at 76 and 10), `openssl base64` (unwrapped and wrapped at 64), and
 `basenc --base64url` (padded and unpadded). It checks that `base64 -d`,
 `openssl base64 -d` and `basenc -d` decode our output back to the input. Then
 it corrupts the encoding and checks that whatever our strict decoder still
-accepts, `base64 -d` decodes the same way. Pass `--count` for more inputs and
+accepts, `base64 -d` decodes the same way. It also decodes GNU's wrapped
+output and `basenc`'s output with padding removed. Pass `--count` for more inputs and
 `--seed` to reproduce a run; CI runs 2000 inputs.
 
 ## Releasing
 
-Push a version tag. The release workflow runs the tests, bundles `package/`
+Push a version tag such as `0.2.0`. The release workflow runs the tests, the
+performance check, and the differential test, bundles `package/`
 with `just bundle`, and attaches the archive to a GitHub release whose notes
 give the package URL.
 
