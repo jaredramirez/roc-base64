@@ -10,6 +10,7 @@ Base64 encoding and decoding for [Roc](https://www.roc-lang.org), following
 - strict decoding by default, rejecting non-canonical input, with errors that
   say what is wrong and where
 - encoding that never fails, to a `Str` or to bytes
+- SIMD encoding and decoding, faster than Rust, Go, and Zig's standard choices on large inputs
 
 Written for the Roc 0.1.0_RC1 compiler.
 
@@ -64,30 +65,58 @@ one of `InvalidByte(byte)`, `InvalidLength`, `MissingPadding`,
 
 ## Performance
 
-Encoding and decoding 1 MiB with the standard alphabet, compared with the
-standard or most popular base64 in other languages. Each figure is the fastest
-of 100 runs, after two warm-up runs, and includes allocating the output.
+Encoding and decoding use SIMD (Roc's `U8x16` vectors, which lower to NEON on
+ARM and SSE on x86-64) for 12 input bytes or 16 characters at a time, following
+Wojciech Muła and Daniel Lemire, ["Faster Base64 Encoding and Decoding using
+AVX2 Instructions"](https://arxiv.org/abs/1704.00605). Decoding drops to a
+byte-at-a-time loop from the first chunk that holds anything but alphabet
+characters, such as padding, whitespace, or an error, so error positions stay
+exact.
+
+Compared with the standard or most popular base64 in other languages, using
+the standard alphabet. Each figure is the fastest of 200 samples, after two
+warm-up runs, and includes allocating the output.
+
+**1 MiB**
 
 | Language | Library | Encode MB/s | Encode µs | Decode MB/s | Decode µs |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Roc | roc-base64 | 2347 | 446.8 | 1663 | 630.2 |
-| Rust | base64 crate | 4675 | 224.3 | 4642 | 225.9 |
-| Go | encoding/base64 | 2921 | 359.0 | 4291 | 244.3 |
-| Zig | std.base64 | 5766 | 181.8 | 4749 | 220.8 |
-| Node.js | Buffer | 27474 | 38.2 | 14521 | 72.2 |
-| Python | base64 (C) | 1349 | 776.8 | 1151 | 910.6 |
+| Roc | roc-base64 | 10512 | 99.8 | 10276 | 102.0 |
+| Rust | base64 crate | 4575 | 229.2 | 4544 | 230.8 |
+| Go | encoding/base64 | 3133 | 334.7 | 4282 | 244.9 |
+| Zig | std.base64 | 5754 | 182.2 | 4747 | 220.9 |
+| Node.js | Buffer | 27654 | 37.9 | 14513 | 72.3 |
+| Python | base64 (C) | 1345 | 779.3 | 1149 | 911.9 |
+
+**64 bytes**, where the fixed cost of each call dominates
+
+| Language | Library | Encode MB/s | Encode ns | Decode MB/s | Decode ns |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Roc | roc-base64 | 2370 | 27 | 1600 | 40 |
+| Rust | base64 crate | 2666 | 24 | 2782 | 23 |
+| Go | encoding/base64 | 1882 | 34 | 2285 | 28 |
+| Zig | std.base64 | 3555 | 18 | 3368 | 19 |
+| Node.js | Buffer | 1882 | 34 | 1142 | 56 |
+| Python | base64 (C) | 640 | 100 | 421 | 152 |
 
 Measured on an Apple M5 Pro with Roc 0.1.0_RC1 (`--opt=speed`), Rust 1.98.1
 with base64 0.22.1, Go 1.26.8, Zig 0.16.0 (`ReleaseFast`), Node.js 24.21.0, and
 Python 3.14.7. MB/s is 10^6 bytes of input (encoding) or output (decoding) per
-second. Node.js uses SIMD ([simdutf](https://github.com/simdutf/simdutf));
-the others are scalar code. roc-base64 also checks
-canonical encoding while decoding, and Python's figures use
-`b64decode(validate=True)` so that it rejects invalid input too.
+second; small inputs time batches of calls covering 256 KiB. Roc figures vary
+by about 10% between runs. Node.js uses
+[simdutf](https://github.com/simdutf/simdutf), which processes 64 bytes at a
+time with interleaving loads that Roc does not expose; Rust, Go, Zig, and
+Python are scalar. roc-base64 also checks canonical encoding while decoding,
+and Python's figures use `b64decode(validate=True)` so that it rejects invalid
+input too.
 
-Run `just bench-compare [SIZE] [ITERATIONS]` to reproduce the table. It enters
-the `bench` devenv profile, which adds the other toolchains, then builds and
-runs the programs in `bench/compare/`.
+`encode` returns a `Str`, which checks that its bytes are UTF-8. Encoding to
+bytes with `encode_to_bytes_with` skips that check and is about 15% faster on
+large inputs.
+
+Run `just bench-compare [SIZE] [ITERATIONS]` to reproduce the tables. It
+enters the `bench` devenv profile, which adds the other toolchains, then builds
+and runs the programs in `bench/compare/`.
 
 ## Development
 
@@ -102,6 +131,7 @@ just test
 just fuzz 30   # check the fuzz examples, then explore for 30 seconds
 just diff      # compare against GNU coreutils and OpenSSL on random inputs
 just bench     # time encoding and decoding 1 MiB
+just perf-check  # fail if SIMD falls below 2x the byte-at-a-time speed
 just docs      # generate API docs in generated-docs/
 ```
 
@@ -110,7 +140,15 @@ automatically. `devenv test` runs the checks, tests, and a formatting check.
 
 The tests include the RFC 4648 vectors, vectors checked against Python's
 `base64` module, and round trips of every byte value with every combination of
-options. The [roc-fuzz](https://github.com/lukewilliamboswell/roc-fuzz) target
+options. To guard the SIMD paths, they compare encoding and decoding with a
+plain reference implementation at every length up to 100 and around larger
+chunk boundaries, place every byte value in every lane of a chunk, and check
+that a bad byte at any position of a long input is reported at that position.
+
+`just perf-check` guards against slowdowns the tests cannot see, such as a
+SIMD path that silently falls back to the byte-at-a-time loop: it fails unless
+SIMD encoding and decoding are at least twice as fast as byte-at-a-time
+baselines measured in the same process. CI runs it on every push. The [roc-fuzz](https://github.com/lukewilliamboswell/roc-fuzz) target
 checks round trips, `encoded_len`, and that strict decoding accepts only
 canonical encodings.
 
@@ -136,5 +174,6 @@ give the package URL.
 - `fuzz/main.roc`: the fuzz target
 - `diff/main.roc`: the differential test against coreutils and OpenSSL
 - `bench/main.roc`: the benchmark
+- `bench/check.roc`: the performance regression check
 - `bench/compare/`: the same benchmark in other languages, and the runner
   that tabulates them

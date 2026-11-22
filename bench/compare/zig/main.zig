@@ -2,17 +2,17 @@
 const std = @import("std");
 const b64 = std.base64.standard;
 
-fn best(io: std.Io, iters: usize, ctx: anytype, comptime f: fn (@TypeOf(ctx)) anyerror!void) !i96 {
+fn best(io: std.Io, iters: usize, reps: usize, ctx: anytype, comptime f: fn (@TypeOf(ctx)) anyerror!void) !i96 {
     try f(ctx);
     try f(ctx); // warm up
     var min: i96 = std.math.maxInt(i96);
     for (0..iters) |_| {
         const start = std.Io.Timestamp.now(io, .awake);
-        try f(ctx);
+        for (0..reps) |_| try f(ctx);
         const ns = start.untilNow(io, .awake).nanoseconds;
         if (ns < min) min = ns;
     }
-    return min;
+    return @divFloor(min, @as(i96, @intCast(reps)));
 }
 
 const Ctx = struct { gpa: std.mem.Allocator, data: []const u8, text: []const u8 };
@@ -36,6 +36,8 @@ pub fn main(init: std.process.Init) !void {
     const size = try std.fmt.parseInt(usize, args[1], 10);
     const iters = try std.fmt.parseInt(usize, args[2], 10);
     const gpa = std.heap.c_allocator;
+    // Each sample times enough calls to cover 256 KiB, for timer resolution
+    const reps = (262144 + @max(size, 1) - 1) / @max(size, 1);
 
     const data = try gpa.alloc(u8, size);
     for (data, 0..) |*byte, i| byte.* = @intCast((i * 31 + 7) % 256);
@@ -46,8 +48,8 @@ pub fn main(init: std.process.Init) !void {
     if (!std.mem.eql(u8, round, data)) return error.RoundTripFailed;
 
     const ctx: Ctx = .{ .gpa = gpa, .data = data, .text = text };
-    const enc = try best(init.io, iters, ctx, encode);
-    const dec = try best(init.io, iters, ctx, decode);
+    const enc = try best(init.io, iters, reps, ctx, encode);
+    const dec = try best(init.io, iters, reps, ctx, decode);
     var buf: [64]u8 = undefined;
     try std.Io.File.stdout().writeStreamingAll(init.io, try std.fmt.bufPrint(&buf, "{d} {d}\n", .{ enc, dec }));
 }

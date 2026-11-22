@@ -10,6 +10,7 @@ check:
     roc check bench/main.roc
     roc check diff/main.roc
     roc check bench/compare/main.roc
+    roc check bench/check.roc
 
 test:
     roc test package/Base64.roc
@@ -39,6 +40,12 @@ bench size="1048576" iterations="100":
     mkdir -p bench-out
     roc build --opt=speed bench/main.roc --output=bench-out/roc
     ./bench-out/roc {{size}} {{iterations}}
+
+# Fail if the SIMD paths fall below 2x the speed of byte-at-a-time baselines.
+perf-check:
+    mkdir -p bench-out
+    roc build --opt=speed bench/check.roc --output=bench-out/check
+    ./bench-out/check
 
 # Compare against Rust, Go, Zig, Node.js, and Python; prints a Markdown table.
 bench-compare size="1048576" iterations="100":

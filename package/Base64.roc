@@ -140,10 +140,23 @@ Base64 := [].{
 	encode_to_bytes_with : List(U8), EncodeOptions -> List(U8)
 	encode_to_bytes_with = |bytes, options| {
 		alphabet = options.alphabet
-		var $out = List.with_capacity(encoded_len(bytes.len(), options))
+		len = bytes.len()
+		var $out = List.with_capacity(encoded_len(len, options))
+
+		# 12 bytes at a time with SIMD, while 16 can be loaded
+		offsets = match alphabet {
+			Standard => standard_offsets
+			UrlSafe => url_safe_offsets
+		}
+		var $start = 0
+		while $start + 16 <= len {
+			$out = encode12(load16(bytes, $start), offsets).append_to($out)
+			$start = $start + 12
+		}
+
 		var $acc = 0.U32
 		var $count = 0.U8
-		for byte in bytes {
+		for byte in bytes.drop_first($start) {
 			$acc = $acc.shl_wrap(8).bitwise_or(byte.to_u32())
 			$count = $count + 1
 			if $count == 3 {
@@ -182,12 +195,31 @@ Base64 := [].{
 	## Decode ASCII bytes instead of a `Str`.
 	decode_bytes_with : List(U8), DecodeOptions -> Try(List(U8), DecodeErr)
 	decode_bytes_with = |chars, options| {
-		var $out = List.with_capacity(chars.len() / 4 * 3 + 2)
+		len = chars.len()
+		var $out = List.with_capacity(len / 4 * 3 + 2)
+
+		# 16 characters at a time with SIMD, until a chunk has anything but
+		# alphabet characters (padding, whitespace, or an error), which the
+		# byte-at-a-time loop below then handles
+		tables = match options.alphabet {
+			Standard => standard_tables
+			UrlSafe => url_safe_tables
+		}
+		var $start = 0
+		while $start + 16 <= len {
+			decoded = decode16(load16(chars, $start), tables)
+			if !decoded.valid {
+				break
+			}
+			$out = decoded.bytes.append_to($out).drop_last(4)
+			$start = $start + 16
+		}
+
 		var $acc = 0.U32
 		var $data = 0.U64
 		var $pads = 0.U64
 		var $last_data = 0.U64
-		var $index = 0.U64
+		var $index = $start
 		table = match options.alphabet {
 			Standard => standard_values
 			UrlSafe => url_safe_values
@@ -197,7 +229,7 @@ Base64 := [].{
 			Reject => False
 		}
 		var $failure = None
-		for c in chars {
+		for c in chars.drop_first($start) {
 			value = match table.get(c.to_u64()) {
 				Ok(v) => v
 				Err(OutOfBounds) => crash "a byte is always within the 256 table entries"
@@ -286,6 +318,173 @@ Base64 := [].{
 			_ => chars
 		}
 	}
+
+	## Read 16 bytes at `start`, which the caller has checked are there
+	load16 : List(U8), U64 -> U8x16
+	load16 = |bytes, start|
+		match U8x16.load(bytes, start) {
+			Ok(v) => v
+			Err(OutOfBounds) => crash "load16 needs start + 16 <= len"
+		}
+
+	## A vector from a list of exactly 16 lanes
+	vector : List(U8) -> U8x16
+	vector = |lanes|
+		match U8x16.from_list(lanes) {
+			Ok(v) => v
+			Err(WrongLength) => crash "vector needs exactly 16 lanes"
+		}
+
+	## Encode the first 12 bytes of `input` as 16 characters (Wojciech Muła
+	## and Daniel Lemire, "Faster Base64 Encoding and Decoding using AVX2
+	## Instructions", 2018, with 16-byte vectors)
+	encode12 : U8x16, U8x16 -> U8x16
+	encode12 = |input, offsets| {
+		# Each group of 3 bytes [a, b, c] becomes the 32-bit lane [b, a, c, b],
+		# so every 6-bit value sits within one 16-bit half
+		shuffled = input.table_lookup(encode_shuffle).to_u16x8_bits()
+		# Move each half's two values into the low 6 bits of their own bytes
+		hi = shuffled.bitwise_and(splat32(0x0FC0FC00)).times_high(splat32(0x04000040))
+		lo = shuffled.bitwise_and(splat32(0x003F03F0)).times_wrap(splat32(0x01000010))
+		values = hi.bitwise_or(lo).to_u8x16_bits()
+		# Map 0..63 to the alphabet by adding an offset per range: 0..25 use
+		# index 13, 26..51 index 0, 52..61 indices 1..10, and 62 and 63 indices
+		# 11 and 12
+		reduced = values.minus_saturated(U8x16.splat(51))
+		upper = values.lt_lanes(U8x16.splat(26)).bitwise_and(U8x16.splat(13))
+		values.plus_wrap(offsets.table_lookup(reduced.bitwise_or(upper)))
+	}
+
+	encode_shuffle : U8x16
+	encode_shuffle = vector([1, 0, 2, 1, 4, 3, 5, 4, 7, 6, 8, 7, 10, 9, 11, 10])
+
+	## The characters for 62 and 63
+	special_chars : Alphabet -> (U8, U8)
+	special_chars = |alphabet|
+		match alphabet {
+			Standard => ('+', '/')
+			UrlSafe => ('-', '_')
+		}
+
+	## Decode 16 characters into 12 bytes, in the first 12 lanes of `bytes`.
+	## `valid` is false if any character is outside the alphabet. Uses the
+	## nibble lookups of Wojciech Muła and Daniel Lemire, "Faster Base64
+	## Encoding and Decoding using AVX2 Instructions", 2018.
+	decode16 : U8x16, DecodeTables -> { bytes : U8x16, valid : Bool }
+	decode16 = |input, tables| {
+		hi = input.shr_zf_wrap(4)
+		lo = input.bitwise_and(U8x16.splat(0x0F))
+		valid = tables.invalid_lo
+			.table_lookup(lo)
+			.bitwise_and(tables.class_hi.table_lookup(hi))
+			.eq_lanes(U8x16.splat(0))
+			.all_lanes_set()
+
+		# Each character plus the offset for its high nibble gives its value;
+		# the character for 63 shares a nibble, so it uses slot nibble + 8
+		is63 = input.eq_lanes(U8x16.splat(tables.c63))
+		values = input.plus_wrap(tables.offsets.table_lookup(hi.bitwise_or(is63.bitwise_and(U8x16.splat(8)))))
+
+		# Join each pair of values into 12 bits, then each pair of those into
+		# the 24 bits of a group, and gather the 3 bytes of each group
+		pairs = values.dot_pairs_saturated(decode_pair_weights).to_u8x16_bits().to_u32x4_bits()
+		groups = pairs.bitwise_and(U32x4.splat(0xFFFF)).shl_wrap(12).bitwise_or(pairs.shr_zf_wrap(16))
+		{ bytes: groups.to_u8x16_bits().table_lookup(decode_shuffle), valid }
+	}
+
+	## Lookup tables for [decode16]. A byte with high nibble `h` and low
+	## nibble `l` is in the alphabet when `invalid_lo[l]` and `class_hi[h]`
+	## share no bits.
+	DecodeTables : { invalid_lo : U8x16, class_hi : U8x16, offsets : U8x16, c63 : U8 }
+
+	standard_tables : DecodeTables
+	standard_tables = tables_for(Standard)
+
+	url_safe_tables : DecodeTables
+	url_safe_tables = tables_for(UrlSafe)
+
+	## Each high nibble's bit: nibbles 0 and 1 (control characters, never
+	## valid) share bit 0, nibbles 2 to 7 get bits 1 to 6, and non-ASCII
+	## nibbles 8 to 15 share bit 7
+	nibble_class : U8 -> U8
+	nibble_class = |h|
+		if h <= 1 {
+			1
+		} else if h <= 7 {
+			(1.U8).shl_wrap(h - 1)
+		} else {
+			0x80
+		}
+
+	tables_for : Alphabet -> DecodeTables
+	tables_for = |alphabet| {
+		(_, c63) = special_chars(alphabet)
+		nibbles = List.from_iter((0.U8).until(16))
+		invalid_lo = nibbles.map(
+			|l| nibbles.fold(
+				0.U8,
+				|bits, h|
+					match sextet(h.shl_wrap(4).bitwise_or(l), alphabet) {
+						Ok(_) => bits
+						Err(NotInAlphabet) => bits.bitwise_or(nibble_class(h))
+					},
+			),
+		)
+		# For each slot, the offset of the alphabet characters there, or 0
+		offset_for = |slot|
+			List.from_iter((0.U32).until(256))
+				.map(|n| n.to_u8_wrap())
+				.keep_if(|c| if (c == c63) slot == c.shr_zf_wrap(4) + 8 else slot == c.shr_zf_wrap(4))
+				.fold(
+					0.U8,
+					|offset, c|
+						match sextet(c, alphabet) {
+							Ok(v) => v.to_u8_wrap().minus_wrap(c)
+							Err(NotInAlphabet) => offset
+						},
+				)
+		{
+			invalid_lo: vector(invalid_lo),
+			class_hi: vector(nibbles.map(nibble_class)),
+			offsets: vector(nibbles.map(offset_for)),
+			c63,
+		}
+	}
+
+	decode_pair_weights : I8x16
+	decode_pair_weights = vector([64, 1, 64, 1, 64, 1, 64, 1, 64, 1, 64, 1, 64, 1, 64, 1]).to_i8x16_bits()
+
+	## The 3 bytes of each group's 24 bits, most significant first; indices of
+	## 16 or more give 0
+	decode_shuffle : U8x16
+	decode_shuffle = vector([2, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13, 12, 255, 255, 255, 255])
+
+	standard_offsets : U8x16
+	standard_offsets = encode_offsets(Standard)
+
+	url_safe_offsets : U8x16
+	url_safe_offsets = encode_offsets(UrlSafe)
+
+	## What to add to each range of values to reach its character; see [encode12]
+	encode_offsets : Alphabet -> U8x16
+	encode_offsets = |alphabet| {
+		(c62, c63) = special_chars(alphabet)
+		uppercase : U8
+		uppercase = 'A'
+		lowercase : U8
+		lowercase = 'a'
+		digits : U8
+		digits = '0'
+		vector(
+			[lowercase - 26]
+				.concat(List.repeat(digits.minus_wrap(52), 10))
+				.concat([c62.minus_wrap(62), c63.minus_wrap(63), uppercase, 0, 0]),
+		)
+	}
+
+	## A 32-bit constant in every lane, viewed as 16-bit lanes
+	splat32 : U32 -> U16x8
+	splat32 = |n| U32x4.splat(n).to_u8x16_bits().to_u16x8_bits()
 
 	## `chars` broken into lines of `width` characters, without a newline after
 	## the last line
@@ -550,3 +749,159 @@ expect Base64.decode("Zh==") == Err(InvalidBase64({ index: 1, problem: NonZeroTr
 expect Base64.decode("Zm9=") == Err(InvalidBase64({ index: 2, problem: NonZeroTrailingBits }))
 expect Base64.decode_with("Zh==", { ..Base64.default_decode, trailing_bits: Allow }) == Ok("f".to_utf8())
 expect Base64.decode_with("Zm9=", { ..Base64.default_decode, trailing_bits: Allow }) == Ok("fo".to_utf8())
+
+# The tests below guard the SIMD paths, which handle 12 input bytes (encoding)
+# or 16 characters (decoding) at a time, by comparing them with a plain
+# reference implementation at every length around those chunk sizes
+
+## A byte-at-a-time encoder to compare against; `chars` is the alphabet
+reference_encode : List(U8), Str -> List(U8)
+reference_encode = |bytes, chars| {
+	alphabet = chars.to_utf8()
+	at = |n, shift|
+		match alphabet.get(n.shr_zf_wrap(shift).bitwise_and(63).to_u64()) {
+			Ok(c) => c
+			Err(OutOfBounds) => crash "six bits always index the alphabet"
+		}
+	bytes.chunks_of(3).fold(
+		[],
+		|out, group|
+			match group {
+				[a, b, c] => {
+					n = a.to_u32().shl_wrap(16).bitwise_or(b.to_u32().shl_wrap(8)).bitwise_or(c.to_u32())
+					out.concat([at(n, 18), at(n, 12), at(n, 6), at(n, 0)])
+				}
+				[a, b] => {
+					n = a.to_u32().shl_wrap(16).bitwise_or(b.to_u32().shl_wrap(8))
+					out.concat([at(n, 18), at(n, 12), at(n, 6), '='])
+				}
+				[a] => {
+					n = a.to_u32().shl_wrap(16)
+					out.concat([at(n, 18), at(n, 12), '=', '='])
+				}
+				_ => out
+			},
+	)
+}
+
+## The error for an `=` at `position` in the middle of a long input: after 2 or
+## 3 characters of a group it is padding, so the next character is the problem
+padding_error : U64 -> Base64.DecodeErr
+padding_error = |position|
+	if position % 4 >= 2 {
+		InvalidBase64({ index: position + 1, problem: DataAfterPadding })
+	} else {
+		InvalidBase64({ index: position, problem: UnexpectedPadding })
+	}
+
+## `list` with the item at `index` replaced
+replace_at : List(U8), U64, U8 -> List(U8)
+replace_at = |list, index, item| list.take_first(index).append(item).concat(list.drop_first(index + 1))
+
+standard_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+url_safe_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+## `len` bytes that differ between positions and between calls with
+## different `seed`s, covering every byte value
+pattern : U64, U64 -> List(U8)
+pattern = |len, seed| List.from_iter((0.U64).until(len)).map(|i| (i * 167 + seed * 31 + i / 7).to_u8_wrap())
+
+lengths : List(U64)
+lengths = List.from_iter((0.U64).until(100)).concat([127, 128, 129, 191, 192, 193, 255, 256, 257, 1000, 1023, 1024, 1025])
+
+# Encoding matches the reference at every length, for both alphabets
+expect lengths.all(
+	|len|
+		[0, 1, 2].all(
+			|seed| {
+				bytes = pattern(len, seed)
+				Base64.encode_to_bytes_with(bytes, Base64.default_encode) == reference_encode(bytes, standard_alphabet)
+					and Base64.encode_to_bytes_with(bytes, { ..Base64.default_encode, alphabet: UrlSafe }) == reference_encode(bytes, url_safe_alphabet)
+			},
+		),
+)
+
+# Decoding the reference output gives back the bytes at every length
+expect lengths.all(
+	|len|
+		[0, 1, 2].all(
+			|seed| {
+				bytes = pattern(len, seed)
+				Base64.decode_bytes_with(reference_encode(bytes, standard_alphabet), Base64.default_decode) == Ok(bytes)
+					and Base64.decode_bytes_with(reference_encode(bytes, url_safe_alphabet), { ..Base64.default_decode, alphabet: UrlSafe }) == Ok(bytes)
+			},
+		),
+)
+
+# Every character of both alphabets decodes in every lane of a chunk
+expect {
+	text = standard_alphabet.to_utf8().concat(standard_alphabet.to_utf8().drop_first(3))
+	Base64.decode_bytes_with(text.take_first(124), Base64.default_decode).map_ok(|bytes| reference_encode(bytes, standard_alphabet)) == Ok(text.take_first(124))
+}
+expect {
+	text = url_safe_alphabet.to_utf8().concat(url_safe_alphabet.to_utf8().drop_first(3))
+	options = { ..Base64.default_decode, alphabet: UrlSafe }
+	Base64.decode_bytes_with(text.take_first(124), options).map_ok(|bytes| reference_encode(bytes, url_safe_alphabet)) == Ok(text.take_first(124))
+}
+
+# Any byte outside the alphabet, at any position of a long input, is reported
+# where it is, by both alphabets
+expect {
+	valid = reference_encode(pattern(96, 5), standard_alphabet)
+	List.from_iter((0.U64).until(valid.len())).all(
+		|position|
+			[0, '\n', ' ', '!', '-', '_', '.', '@', '[', '`', '{', 0x7F, 0x80, 0xFF].all(
+				|bad| {
+					text = replace_at(valid, position, bad)
+					Base64.decode_bytes_with(text, Base64.default_decode) == Err(InvalidBase64({ index: position, problem: InvalidByte(bad) }))
+				},
+			),
+	)
+}
+expect {
+	valid = reference_encode(pattern(96, 6), url_safe_alphabet)
+	options = { ..Base64.default_decode, alphabet: UrlSafe }
+	List.from_iter((0.U64).until(valid.len())).all(
+		|position|
+			['+', '/', ' ', 0x80].all(
+				|bad| Base64.decode_bytes_with(replace_at(valid, position, bad), options) == Err(InvalidBase64({ index: position, problem: InvalidByte(bad) })),
+			)
+				and (position + 1 == valid.len() or Base64.decode_bytes_with(replace_at(valid, position, '='), options) == Err(padding_error(position))),
+	)
+}
+
+# Every byte value is classified correctly in every lane of a SIMD chunk
+expect {
+	valid = reference_encode(pattern(48, 7), standard_alphabet)
+	List.from_iter((0.U64).until(256)).all(
+		|n| {
+			byte = n.to_u8_wrap()
+			in_alphabet = standard_alphabet.to_utf8().contains(byte)
+			[17, 18, 19, 20].all(
+				|position| {
+					result = Base64.decode_bytes_with(replace_at(valid, position, byte), Base64.default_decode)
+					if in_alphabet {
+						result.is_ok()
+					} else if byte == '=' {
+						result == Err(padding_error(position))
+					} else {
+						result == Err(InvalidBase64({ index: position, problem: InvalidByte(byte) }))
+					}
+				},
+			)
+		},
+	)
+}
+
+# Whitespace and padding late in long inputs still decode
+expect {
+	bytes = pattern(200, 8)
+	text = reference_encode(bytes, standard_alphabet)
+	wrapped = text.take_first(100).append('\n').concat(text.drop_first(100))
+	Base64.decode_bytes_with(wrapped, { ..Base64.default_decode, whitespace: Ignore }) == Ok(bytes)
+}
+expect {
+	bytes = pattern(199, 9)
+	Base64.decode_bytes_with(reference_encode(bytes, standard_alphabet), Base64.default_decode) == Ok(bytes)
+}

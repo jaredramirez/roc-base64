@@ -38,7 +38,8 @@ run_entry! = |entry, size, iterations| {
 	}
 }
 
-## Throughput in MB/s (10^6 bytes per second) with no decimals
+## Throughput in MB/s (10^6 bytes per second) with no decimals; each
+## benchmark reports time per call
 mb_per_s : U64, U64 -> Str
 mb_per_s = |bytes, ns| (bytes * 1000 / ns).to_str()
 
@@ -49,19 +50,24 @@ micros = |ns| {
 	"${(tenths / 10).to_str()}.${(tenths % 10).to_str()}"
 }
 
+## Time per call in µs for large inputs, or in ns for small ones
+time_unit : U64 -> (Str, (U64 -> Str))
+time_unit = |size| if (size >= 16384) ("µs", micros) else ("ns", |ns| ns.to_str())
+
 run! = |os_args|
 	match os_args.map(OsStr.display) {
 		[size_str, iterations_str] => {
 			size = U64.from_str(size_str) ? |_| BenchFailed("SIZE must be an integer")
+			(unit, show_time) = time_unit(size)
 			var $rows = []
 			for entry in entries {
 				(encode_ns, decode_ns) = run_entry!(entry, size_str, iterations_str)?
 				$rows = $rows.append(
-					"| ${entry.name} | ${entry.library} | ${mb_per_s(size, encode_ns)} | ${micros(encode_ns)} | ${mb_per_s(size, decode_ns)} | ${micros(decode_ns)} |",
+					"| ${entry.name} | ${entry.library} | ${mb_per_s(size, encode_ns)} | ${show_time(encode_ns)} | ${mb_per_s(size, decode_ns)} | ${show_time(decode_ns)} |",
 				)
 			}
 			header = [
-				"| Language | Library | Encode MB/s | Encode µs | Decode MB/s | Decode µs |",
+				"| Language | Library | Encode MB/s | Encode ${unit} | Decode MB/s | Decode ${unit} |",
 				"| --- | --- | ---: | ---: | ---: | ---: |",
 			]
 			Stdout.line!(Str.join_with(header.concat($rows), "\n"))?

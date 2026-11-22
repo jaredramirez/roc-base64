@@ -25,9 +25,12 @@ main! = |os_args|
 				Stderr.line!("round trip failed")?
 				return Err(Exit(1))
 			}
-			encode_ns = best!(iterations, |{}| Base64.encode(bytes).to_utf8().len())
+			# Each sample times enough calls to cover 256 KiB, for timer resolution
+			reps = if (size == 0) 1 else (262144 + size - 1) / size
+			encode_ns = best!(iterations, reps, |{}| Base64.encode(bytes).to_utf8().len())
 			decode_ns = best!(
 				iterations,
+				reps,
 				|{}| match Base64.decode(text) {
 					Ok(decoded) => decoded.len()
 					Err(_) => 0
@@ -42,18 +45,21 @@ main! = |os_args|
 		}
 	}
 
-## The fastest of `iterations` runs of `f`, in nanoseconds. Each run's output
-## length is checked, so the work cannot be skipped.
-best! : U64, ({} -> U64) => U64
-best! = |iterations, f| {
+## The fastest of `iterations` samples of `reps` runs of `f`, in nanoseconds
+## per run. Each run's output length is checked, so the work cannot be skipped.
+best! : U64, U64, ({} -> U64) => U64
+best! = |iterations, reps, f| {
 	_warm1 = f({})
 	_warm2 = f({})
 	var $min = 0xFFFF_FFFF_FFFF_FFFF.U64
 	for _ in List.from_iter((0.U64).until(iterations)) {
 		start = Monotonic.now!()
-		len = f({})
-		ns = start.elapsed!().to_nanos()
-		if len == 0 {
+		var $len = 0
+		for _ in List.from_iter((0.U64).until(reps)) {
+			$len = $len + f({})
+		}
+		ns = start.elapsed!().to_nanos() / reps
+		if $len == 0 {
 			crash "a run produced no output"
 		}
 		if ns < $min {
